@@ -12,7 +12,7 @@ Btrfs root, Limine + snapper snapshots, two kernels (Debian LTS + CachyOS), KDE 
 
 1. Boot a Debian 13 Live ISO **in UEFI mode**, connect to the network.
 2. ```sh
-   git clone <your-repo-url> && cd debian-handheld-installer
+   git clone https://github.com/KiziCat/debian_gaming/ && cd debian-handheld-installer
    chmod +x install.sh chroot/*.sh files/*
    sudo ./install.sh
    ```
