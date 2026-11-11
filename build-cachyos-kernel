@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# build-cachyos-kernel - build the latest stable kernel with the CachyOS patchset into Debian packages
+# and install them. Used by the installer and available afterwards as `sudo build-cachyos-kernel`.
+#
+#   sudo build-cachyos-kernel                 build + install
+#   sudo build-cachyos-kernel --no-install    build only (debs land in /var/cache/handheld-kernels)
+#
+# Environment overrides:
+#   KERNEL_VERSION=7.0.8   PATCH_SERIES=7.0   X86_LEVEL=2|3   JOBS=4   WORK=/var/tmp/cachyos-build
+#   FAST_BUILD=1           drop debug info + BTF (much faster/smaller build, but no sched_ext/scx)
+#   KEEP_WORK=1            keep the source tree afterwards
+set -Eeuo pipefail
+[[ $EUID -eq 0 ]] || exec sudo -E "$0" "$@"
+
+INSTALL=1; [[ ${1:-} == --no-install ]] && INSTALL=0
+WORK=${WORK:-/var/tmp/cachyos-build}
+OUT=/var/cache/handheld-kernels
+PATCH_RAW=https://raw.githubusercontent.com/CachyOS/kernel-patches/master
+CONFIG_URL=https://raw.githubusercontent.com/CachyOS/linux-cachyos/master/linux-cachyos/config
+export DEBIAN_FRONTEND=noninteractive
+
+say() { echo -e "\e[32m[cachyos-kernel]\e[0m $*"; }
+die() { echo -e "\e[31m[cachyos-kernel] $*\e[0m" >&2; exit 1; }
+
+# ---- micro-architecture level ----------------------------------------------------------
+if [[ -z ${X86_LEVEL:-} ]]; then
+    flags=$(grep -m1 '^flags' /proc/cpuinfo)
+    X86_LEVEL=3
+    for f in avx2 bmi1 bmi2 fma movbe f16c abm; do
+        grep -qw "$f" <<<"$flags" || { X86_LEVEL=2; break; }
+    done
+fi
+
+# ---- build dependencies ----------------------------------------------------------------
+say "Installing build dependencies..."
+apt-get update -qq
+apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libncurses-dev dwarves cpio kmod rsync \
+    dpkg-dev fakeroot debhelper curl xz-utils zstd git python3 perl patch initramfs-tools linux-base
+
+# ---- pick versions ---------------------------------------------------------------------
+if [[ -z ${KERNEL_VERSION:-} || -z ${PATCH_SERIES:-} ]]; then
+    say "Querying kernel.org and the CachyOS patch repository..."
+    read -r KERNEL_VERSION PATCH_SERIES < <(python3 - <<'PY'
+import json, re, urllib.request
+def get(u):
+    r = urllib.request.Request(u, headers={"User-Agent": "handheld-installer"})
+    return urllib.request.urlopen(r, timeout=30).read()
+key = lambda v: tuple(int(x) for x in v.split("."))
+rel = json.loads(get("https://www.kernel.org/releases.json"))
+stable = [r["version"] for r in rel["releases"] if r["moniker"] in ("stable", "longterm")]
+latest = rel["latest_stable"]["version"]
+dirs = [d["name"] for d in json.loads(get("https://api.github.com/repos/CachyOS/kernel-patches/contents/"))
+        if d["type"] == "dir" and re.fullmatch(r"\d+\.\d+", d["name"])]
+want = ".".join(latest.split(".")[:2])
+series = want if want in dirs else max((d for d in dirs if key(d) <= key(want)), key=key)
+cands = [v for v in stable if ".".join(v.split(".")[:2]) == series]
+print(max(cands, key=key) if cands else series, series)
+PY
+    )
+fi
+[[ -n $KERNEL_VERSION && -n $PATCH_SERIES ]] || die "could not determine kernel/patch version"
+say "Kernel $KERNEL_VERSION  | CachyOS patch series $PATCH_SERIES  | x86-64-v$X86_LEVEL"
+
+# ---- RAM-aware parallelism -------------------------------------------------------------
+mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+max_by_mem=$(( mem_kb / 1500000 )); ((max_by_mem < 1)) && max_by_mem=1
+JOBS=${JOBS:-$(( $(nproc) < max_by_mem ? $(nproc) : max_by_mem ))}
+
+# ---- fetch -----------------------------------------------------------------------------
+rm -rf "$WORK"; mkdir -p "$WORK" "$OUT"; cd "$WORK"
+major=${KERNEL_VERSION%%.*}
+say "Downloading kernel source..."
+curl -fL --retry 3 -o linux.tar.xz "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.xz"
+tar -xf linux.tar.xz && rm linux.tar.xz
+cd "linux-${KERNEL_VERSION}"
+
+say "Fetching CachyOS patches + config..."
+curl -fL --retry 3 -o ../cachyos-base.patch "$PATCH_RAW/$PATCH_SERIES/all/0001-cachyos-base-all.patch"
+curl -fL --retry 3 -o ../bore.patch         "$PATCH_RAW/$PATCH_SERIES/sched/0001-bore-cachy.patch"
+curl -fL --retry 3 -o .config               "$CONFIG_URL"
+patch -Np1 < ../cachyos-base.patch
+patch -Np1 < ../bore.patch
+
+# ---- configure -------------------------------------------------------------------------
+echo "-cachyos" > localversion.20-cachyos
+scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
+scripts/config -e CACHY -e SCHED_BORE
+scripts/config --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS ""
+if grep -q 'GENERIC_CPU3' arch/x86/Kconfig.cpu 2>/dev/null; then
+    case $X86_LEVEL in
+        3) scripts/config -d GENERIC_CPU -e GENERIC_CPU3 ;;
+        2) scripts/config -d GENERIC_CPU -e GENERIC_CPU2 ;;
+    esac
+else
+    say "WARNING: patchset has no generic-v2/v3 CPU option, building with the config default"
+fi
+if [[ ${FAST_BUILD:-0} == 1 ]]; then
+    scripts/config -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -e DEBUG_INFO_NONE -d DEBUG_INFO_DWARF5 -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT || true
+fi
+make olddefconfig
+rel=$(make -s kernelrelease)
+say "Building $rel with $JOBS jobs (this is the slow part)..."
+
+# ---- build -----------------------------------------------------------------------------
+make -j"$JOBS" bindeb-pkg KDEB_PKGVERSION="${KERNEL_VERSION}-1" KBUILD_BUILD_USER=handheld KBUILD_BUILD_HOST=debian
+cd "$WORK"
+cp -v linux-image-"${rel}"_*.deb linux-headers-"${rel}"_*.deb "$OUT/"
+
+if ((INSTALL)); then
+    say "Installing $rel (initramfs + Limine entry are generated by the kernel hooks)..."
+    apt-get install -y "$OUT"/linux-image-"${rel}"_*.deb "$OUT"/linux-headers-"${rel}"_*.deb
+fi
+[[ ${KEEP_WORK:-0} == 1 ]] || rm -rf "$WORK"
+say "Done. Packages are in $OUT"

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# limine-snapper-sync - regenerate /boot/limine.conf from installed kernels and snapper snapshots.
+#
+# Limine can only read FAT, not Btrfs. So for every snapper snapshot N we
+#   (a) make a writable Btrfs clone  /.rescue/N   (the snapshot itself stays read-only and pristine)
+#   (b) keep a copy of the matching kernel + initramfs on the ESP: /boot/snapshots/N/
+# and add a boot entry that boots the clone via rootflags=subvol=@rescue/N.
+# Safe to run any time; it is idempotent and takes a lock.
+set -uo pipefail
+
+CONF_FILE=/etc/default/limine-handheld
+# shellcheck disable=SC1090
+[[ -r $CONF_FILE ]] && . "$CONF_FILE"
+: "${ESP:=/boot}" "${TIMEOUT:=5}" "${CMDLINE_EXTRA:=quiet}" "${DEFAULT_FLAVOR:=cachyos}"
+: "${ROOT_SUBVOL:=@}" "${SNAP_DIR:=/.snapshots}" "${RESCUE_DIR:=/.rescue}"
+: "${ROOT_UUID:?ROOT_UUID missing in $CONF_FILE}"
+
+say() { echo "limine-snapper-sync: $*" >&2; }
+
+mountpoint -q "$ESP" || { say "$ESP is not mounted, skipping"; exit 0; }
+exec 9>/run/limine-snapper-sync.lock
+flock 9
+
+# ---- 1. deploy the Limine EFI binary (also acts as the firmware fallback loader) ----------
+EFI_SRC=/usr/local/share/limine/BOOTX64.EFI
+if [[ -f $EFI_SRC ]]; then
+    for d in EFI/limine EFI/BOOT; do
+        mkdir -p "$ESP/$d"
+        cmp -s "$EFI_SRC" "$ESP/$d/BOOTX64.EFI" || install -m 0644 "$EFI_SRC" "$ESP/$d/BOOTX64.EFI"
+    done
+fi
+
+# ---- 2. helpers -------------------------------------------------------------------------
+flavor_of() { case $1 in *cachyos*) echo cachyos ;; *) echo lts ;; esac; }
+label_of()  { case $(flavor_of "$1") in cachyos) echo "CachyOS kernel $1" ;; *) echo "Debian LTS kernel $1" ;; esac; }
+
+# emit_boot <kernel-version> <subvolume> <path-prefix-on-ESP>
+emit_boot() {
+    printf '    protocol: linux\n'
+    printf '    path: boot():/%svmlinuz-%s\n' "$3" "$1"
+    printf '    module_path: boot():/%sinitrd.img-%s\n' "$3" "$1"
+    printf '    cmdline: root=UUID=%s rootflags=subvol=%s rw %s\n' "$ROOT_UUID" "$2" "$CMDLINE_EXTRA"
+}
+
+xml_field() { sed -n "s|.*<$1>\\(.*\\)</$1>.*|\\1|p" "$2" 2>/dev/null | head -n1; }
+
+# ---- 3. kernels currently on the ESP ----------------------------------------------------
+declare -A newest=()
+older=()
+mapfile -t vers < <(
+    for f in "$ESP"/vmlinuz-*; do
+        [[ -e $f ]] || continue
+        v=${f##*/vmlinuz-}
+        [[ -e $ESP/initrd.img-$v ]] && echo "$v"
+    done | sort -Vr
+)
+if ((${#vers[@]} == 0)); then say "no kernels on $ESP, leaving limine.conf untouched"; exit 0; fi
+for v in "${vers[@]}"; do
+    f=$(flavor_of "$v")
+    if [[ -z ${newest[$f]:-} ]]; then newest[$f]=$v; else older+=("$v"); fi
+done
+
+order=("$DEFAULT_FLAVOR")
+for f in cachyos lts; do [[ $f != "$DEFAULT_FLAVOR" ]] && order+=("$f"); done
+
+# ---- 4. snapshot entries (clone + kernel copy) -------------------------------------------
+snapshot_entries() {
+    # Refuse to touch anything if the subvolumes are not mounted (we would otherwise prune everything).
+    mountpoint -q "$SNAP_DIR" && mountpoint -q "$RESCUE_DIR" || return 0
+    mkdir -p "$ESP/snapshots"
+    local id base date type desc v f dst m
+    local -A seen
+    while read -r id; do
+        base=$SNAP_DIR/$id
+        [[ -d $base/snapshot ]] || continue
+        date=$(xml_field date "$base/info.xml")
+        type=$(xml_field type "$base/info.xml")
+        desc=$(xml_field description "$base/info.xml" | tr '/' ' ' | tr -cd '[:alnum:] ._:+-')
+
+        if [[ ! -d $RESCUE_DIR/$id ]]; then
+            btrfs subvolume snapshot "$base/snapshot" "$RESCUE_DIR/$id" >/dev/null 2>&1 \
+                || { say "cannot clone snapshot $id"; continue; }
+        fi
+
+        seen=()
+        while read -r v; do
+            [[ -n $v ]] || continue
+            f=$(flavor_of "$v")
+            [[ -n ${seen[$f]:-} ]] && continue
+            dst=$ESP/snapshots/$id
+            if [[ ! -e $dst/vmlinuz-$v || ! -e $dst/initrd.img-$v ]]; then
+                [[ -e $ESP/vmlinuz-$v && -e $ESP/initrd.img-$v ]] || continue
+                mkdir -p "$dst"
+                if ! { cp "$ESP/vmlinuz-$v" "$dst/vmlinuz-$v.part" && cp "$ESP/initrd.img-$v" "$dst/initrd.img-$v.part" \
+                       && mv -f "$dst/vmlinuz-$v.part" "$dst/vmlinuz-$v" && mv -f "$dst/initrd.img-$v.part" "$dst/initrd.img-$v"; }; then
+                    say "could not copy kernel $v for snapshot $id (ESP full?)"
+                    rm -f "$dst"/*.part
+                    continue
+                fi
+            fi
+            seen[$f]=1
+            printf '//Snapshot %s  %s  [%s] %s  (%s)\n' "$id" "$date" "$type" "$desc" "$v"
+            emit_boot "$v" "@rescue/$id" "snapshots/$id/"
+        done < <(for m in "$base"/snapshot/usr/lib/modules/*/; do [[ -e ${m}modules.dep ]] && basename "$m"; done | sort -Vr)
+    done < <(find "$SNAP_DIR" -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9]+' -printf '%f\n' | sort -nr)
+
+    # prune clones / kernel copies of snapshots snapper has deleted
+    for m in "$RESCUE_DIR"/*; do
+        [[ -d $m ]] || continue; id=${m##*/}
+        [[ $id =~ ^[0-9]+$ && ! -d $SNAP_DIR/$id/snapshot ]] && btrfs subvolume delete "$m" >/dev/null 2>&1
+    done
+    for m in "$ESP"/snapshots/*; do
+        [[ -d $m ]] || continue; id=${m##*/}
+        [[ $id =~ ^[0-9]+$ && ! -d $SNAP_DIR/$id/snapshot ]] && rm -rf "$m"
+    done
+}
+SNAP_OUT=$(snapshot_entries)
+
+# ---- 5. write limine.conf ---------------------------------------------------------------
+tmp=$ESP/limine.conf.new
+{
+    echo "timeout: $TIMEOUT"
+    echo "default_entry: 1"
+    echo "interface_branding: Debian Handheld"
+    echo
+    for f in "${order[@]}"; do
+        v=${newest[$f]:-}; [[ -n $v ]] || continue
+        echo "/$(label_of "$v")"
+        emit_boot "$v" "$ROOT_SUBVOL" ""
+        echo
+    done
+    if ((${#older[@]})); then
+        echo "/Older kernels"
+        for v in "${older[@]}"; do
+            echo "//$(label_of "$v")"
+            emit_boot "$v" "$ROOT_SUBVOL" ""
+        done
+        echo
+    fi
+    if [[ -n $SNAP_OUT ]]; then
+        echo "/Snapshots (rescue)"
+        echo "$SNAP_OUT"
+        echo
+    fi
+} > "$tmp" && mv -f "$tmp" "$ESP/limine.conf"
+
+say "limine.conf updated: kernels=${#vers[@]} snapshots=$(grep -c '^//Snapshot' "$ESP/limine.conf")"
