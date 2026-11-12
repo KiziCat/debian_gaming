@@ -1,4 +1,4 @@
-# Debian Handheld Gaming Installer
+# Debian Handheld Gaming Installer - WIP
 
 Installs Debian 13 (trixie) on a handheld gaming PC (older Intel / AMD, no NVIDIA) from a Debian Live ISO:
 Btrfs root, Limine + snapper snapshots, two kernels (Debian LTS + CachyOS), KDE Plasma with SDDM, Steam installed
