@@ -13,7 +13,7 @@ trap 'warn "setup.sh failed near line $LINENO"' ERR
 put() { install -D -m 0755 "$HERE/files/$1" "$2"; }   # put <file-in-files/> <destination>
 
 # =========================================================================================
-# 1. APT: contrib + non-free + backports (gamescope is only in trixie-backports), i386 for Steam
+# 1. APT: contrib + non-free + backports (inert unless you use -t), i386 for Steam
 # =========================================================================================
 log "Configuring APT..."
 rm -f /etc/apt/sources.list
@@ -79,17 +79,26 @@ DEFAULT_FLAVOR=$DEFAULT_FLAVOR
 EOF
 
 # Limine is not packaged in Debian 13 -> take the upstream binary release (UEFI loader only).
+# Upstream publishes prebuilt files on branches named vN.x-binary, and a new major can exist as source
+# before its binary branch does, so ask the remote which binary branches exist instead of hardcoding one.
 log "Fetching Limine..."
 install_core git
-tmp=$(mktemp -d)
-tag=$(curl -fsSL https://api.github.com/repos/limine-bootloader/limine/releases/latest 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1 || true)
-got=0
-for br in ${LIMINE_BRANCH:-v12.x-binary} ${tag:+${tag}-binary} binary; do
-    if git clone --quiet --depth 1 --branch "$br" https://github.com/limine-bootloader/limine.git "$tmp/limine" 2>/dev/null; then
-        got=1; info "Limine from branch/tag: $br"; break
+LIMINE_URL=https://github.com/limine-bootloader/limine.git
+mapfile -t limine_candidates < <(
+    [[ -n ${LIMINE_BRANCH:-} ]] && echo "$LIMINE_BRANCH"
+    git ls-remote --heads "$LIMINE_URL" 'v*.x-binary' 2>/dev/null | sed 's|.*refs/heads/||' | sort -Vr
+    echo v11.x-binary      # last known good if the remote could not be queried
+    echo binary
+)
+tmp=$(mktemp -d); got=""
+for br in "${limine_candidates[@]}"; do
+    rm -rf "$tmp/limine"
+    if git clone --quiet --depth 1 --branch "$br" "$LIMINE_URL" "$tmp/limine" 2>/dev/null && [[ -f $tmp/limine/BOOTX64.EFI ]]; then
+        got=$br; break
     fi
 done
-((got)) && [[ -f $tmp/limine/BOOTX64.EFI ]] || die "Could not download Limine (BOOTX64.EFI). Set LIMINE_BRANCH and retry."
+[[ -n $got ]] || die "Could not download a Limine binary (tried: ${limine_candidates[*]}). Set LIMINE_BRANCH and retry."
+info "Limine from branch: $got"
 install -D -m 0644 "$tmp/limine/BOOTX64.EFI" /usr/local/share/limine/BOOTX64.EFI
 rm -rf "$tmp"
 
@@ -126,7 +135,7 @@ install_available plasma-nm plasma-pa plasma-discover plasma-discover-backend-fl
     xdg-desktop-portal-kde xdg-desktop-portal-gtk konsole dolphin kate ark spectacle firefox-esr \
     bluedevil kscreen powerdevil kinfocenter maliit-keyboard qml6-module-qtquick-virtualkeyboard || true
 
-log "Installing the gaming stack (Steam, gamescope, Mesa 32-bit, MangoHud, GameMode)..."
+log "Installing the gaming stack (Steam, Mesa 32-bit, MangoHud, GameMode)..."
 echo "steam steam/question select I AGREE"          | debconf-set-selections
 echo "steam steam/license note"                     | debconf-set-selections
 echo "steam-installer steam/question select I AGREE" | debconf-set-selections
@@ -134,7 +143,6 @@ echo "steam-installer steam/license note"           | debconf-set-selections
 install_core steam-installer steam-devices
 install_available mesa-vulkan-drivers:i386 libgl1-mesa-dri:i386 libasound2-plugins:i386 \
     mangohud gamemode vulkan-tools mesa-utils libva-utils game-devices-udev joystick evtest || true
-apt-get install -y -t "${SUITE}-backports" gamescope || warn "gamescope (trixie-backports) failed to install - Gaming Mode will not work"
 
 log "Installing audio (PipeWire + WirePlumber + ALSA), network, power..."
 install_core pipewire-audio pipewire-alsa pipewire-pulse wireplumber alsa-utils alsa-ucm-conf
@@ -160,30 +168,9 @@ passwd -l root >/dev/null
 sed -i '/^USER_HASH=/d' /etc/handheld-installer.env     # don't leave the hash around longer than needed
 
 # =========================================================================================
-# 8. Sessions: SDDM lets you choose Plasma (Wayland) or Steam Gaming Mode (gamescope)
+# 8. SDDM + Steam shortcuts (Steam client package is installed above; Big Picture launcher added here)
 # =========================================================================================
-log "Configuring SDDM sessions..."
-put gamescope-session-steam /usr/local/bin/gamescope-session-steam
-put steamos-session-select  /usr/local/bin/steamos-session-select
-put steamos-update          /usr/local/bin/steamos-update
-put handheld-session-set    /usr/local/sbin/handheld-session-set
-put return-to-gamemode      /usr/local/bin/return-to-gamemode
-mkdir -p /etc/handheld
-cat > /etc/handheld/gamescope.conf <<'EOF'
-# Options for Steam Gaming Mode (sourced by /usr/local/bin/gamescope-session-steam)
-# Portrait-native panel that comes up rotated?  Try:  GAMESCOPE_ARGS="--force-orientation left"   (or right / inverted)
-GAMESCOPE_ARGS=""
-# Steam launch flags:
-#STEAM_ARGS="-steamos3 -steampal -steamdeck -gamepadui"
-EOF
-cat > /usr/share/wayland-sessions/steam-gamescope.desktop <<'EOF'
-[Desktop Entry]
-Name=Steam (Gaming Mode)
-Comment=Steam Big Picture inside gamescope
-Exec=/usr/local/bin/gamescope-session-steam
-Type=Application
-DesktopNames=gamescope
-EOF
+log "Configuring SDDM and Steam shortcuts..."
 mkdir -p /etc/sddm.conf.d
 cat > /etc/sddm.conf.d/10-handheld.conf <<'EOF'
 # Wayland greeter: respects the panel's DRM orientation quirks (portrait-native handheld screens)
@@ -196,27 +183,31 @@ CompositorCommand=kwin_wayland --drm --no-lockscreen --no-global-shortcuts --loc
 EOF
 # only keep the on-screen keyboard option when the plugin really got installed
 dpkg -s qml6-module-qtquick-virtualkeyboard >/dev/null 2>&1 || sed -i '/^InputMethod=/d' /etc/sddm.conf.d/10-handheld.conf
-
-cat > "/etc/sudoers.d/handheld-session" <<EOF
-$USERNAME ALL=(root) NOPASSWD: /usr/local/sbin/handheld-session-set
-EOF
-chmod 440 /etc/sudoers.d/handheld-session
 if [[ $AUTOLOGIN == yes ]]; then
     cat > /etc/sddm.conf.d/20-autologin.conf <<EOF
 [Autologin]
 User=$USERNAME
-Session=steam-gamescope.desktop
-Relogin=true
-EOF
-    cat > /usr/share/applications/return-to-gamemode.desktop <<'EOF'
-[Desktop Entry]
-Name=Return to Gaming Mode
-Exec=/usr/local/bin/return-to-gamemode
-Icon=steam
-Type=Application
-Categories=Game;
+Session=plasma.desktop
 EOF
 fi
+
+cat > /usr/share/applications/steam-bigpicture.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Steam Big Picture
+Comment=Steam in controller-friendly full-screen mode
+Exec=/usr/games/steam steam://open/bigpicture
+Icon=steam
+Terminal=false
+Categories=Game;
+EOF
+# Desktop icons for the user: Steam + Steam Big Picture (must be executable to be trusted by Plasma)
+u_home=$(getent passwd "$USERNAME" | cut -d: -f6)
+mkdir -p "$u_home/Desktop"
+for f in steam.desktop steam-bigpicture.desktop; do
+    [[ -f /usr/share/applications/$f ]] && install -m 0755 "/usr/share/applications/$f" "$u_home/Desktop/$f"
+done
+chown -R "$USERNAME:$USERNAME" "$u_home/Desktop"
 
 # =========================================================================================
 # 9. Handheld Daemon (controller emulation, TDP, gyro, RGB) - best effort

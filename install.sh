@@ -24,12 +24,13 @@ BTRFS_OPTS="noatime,compress=zstd:1,discard=async"
 cleanup() {
     set +e
     if mountpoint -q "$TARGET"; then
-        umount -R "$TARGET" 2>/dev/null || umount -R -l "$TARGET"
+        umount -R "$TARGET" 2>/dev/null || umount -R -l "$TARGET" 2>/dev/null
     fi
-    mountpoint -q /mnt/btrfs-top && umount /mnt/btrfs-top
+    if mountpoint -q /mnt/btrfs-top; then umount /mnt/btrfs-top; fi
+    return 0    # must never return non-zero: the ERR trap would turn a clean exit into "Installer failed"
 }
 trap cleanup EXIT
-trap 'die "Installer failed near line $LINENO. Nothing is half-configured that a re-run (after wiping the disk) cannot fix."' ERR
+trap 'die "Installer failed near line $LINENO - see the message above. A re-run after wiping the disk is safe."' ERR
 
 part_of() { [[ $1 =~ [0-9]$ ]] && echo "${1}p$2" || echo "${1}$2"; }
 
@@ -55,18 +56,24 @@ print_hardware
 # ------------------------------------------------------------------------------------------
 # 2. Questions
 # ------------------------------------------------------------------------------------------
-LIVE_DISK=""
-if src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null); then
-    LIVE_DISK="/dev/$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1)"
-fi
-if [[ -z ${DISK:-} ]]; then
-    echo; info "Available disks (the live medium is hidden):"
-    lsblk -dpno NAME,SIZE,MODEL,TRAN,TYPE | awk '$NF=="disk"' | grep -v "^${LIVE_DISK:-NONE} " || true
-    echo
-fi
-prompt_var DISK "Install to which disk? (e.g. /dev/nvme0n1)"
+# Find the disk the live system booted from so it can be hidden from the list (never fails the script).
+find_live_disk() {
+    local mnt src parent
+    for mnt in /run/live/medium /usr/lib/live/mount/medium /lib/live/mount/medium; do
+        src=$(findmnt -no SOURCE "$mnt" 2>/dev/null) || continue
+        src=${src%%[*}
+        [[ -b $src ]] || continue
+        parent=$(lsblk -ndo PKNAME "$src" 2>/dev/null | head -n1) || true
+        if [[ -n $parent ]]; then echo "/dev/$parent"; else echo "$src"; fi
+        return 0
+    done
+    return 0
+}
+LIVE_DISK=$(find_live_disk) || LIVE_DISK=""
+
+[[ -n ${DISK:-} ]] || pick_disk "$LIVE_DISK"
 [[ -b $DISK ]] || die "$DISK is not a block device"
-[[ $DISK != "$LIVE_DISK" ]] || die "$DISK is the live medium"
+[[ -z $LIVE_DISK || $DISK != "$LIVE_DISK" ]] || die "$DISK is the live medium"
 
 prompt_var TARGET_HOSTNAME "Hostname" "handheld"
 prompt_var USERNAME "Username"
@@ -81,13 +88,16 @@ if [[ -z ${USERPASS:-} ]]; then
     USERPASS=$p1
 fi
 default_tz=$(cat /etc/timezone 2>/dev/null || echo UTC)
-prompt_var TIMEZONE "Timezone" "$default_tz"
-[[ -e /usr/share/zoneinfo/$TIMEZONE ]] || die "Unknown timezone $TIMEZONE"
+if [[ -n ${TIMEZONE:-} ]]; then
+    [[ -e /usr/share/zoneinfo/$TIMEZONE ]] || die "Unknown timezone $TIMEZONE"
+else
+    pick_timezone "$default_tz"
+fi
 prompt_var LOCALE "Locale" "en_US.UTF-8"
 prompt_var KB_LAYOUT "Keyboard layout (XKB, e.g. us, pl, de)" "us"
 
 if [[ -z ${AUTOLOGIN:-} ]]; then
-    ask_yn "Autologin straight into Steam Gaming Mode? (otherwise SDDM lets you pick a session)" n && AUTOLOGIN=yes || AUTOLOGIN=no
+    ask_yn "Log in automatically (skip the SDDM login screen)?" n && AUTOLOGIN=yes || AUTOLOGIN=no
 fi
 if [[ -z ${INSTALL_HHD:-} ]]; then
     d=n; [[ $HW_HANDHELD != none ]] && d=y
@@ -219,7 +229,10 @@ rm -rf "$TARGET/opt/handheld-installer" "$TARGET/etc/handheld-installer.env"
 rm -f  "$TARGET/etc/resolv.conf"        # NetworkManager recreates it on first boot
 sync
 log "Installation finished."
-info "Remove the live medium and reboot. Choose your kernel in the Limine menu; pick the session in SDDM."
+info "Remove the live medium and reboot. Choose your kernel in the Limine menu."
 if [[ -z ${ASSUME_YES:-} ]] && ask_yn "Reboot now?" y; then
-    cleanup; trap - EXIT; reboot
+    trap - ERR EXIT
+    cleanup
+    sync
+    systemctl reboot || reboot -f
 fi

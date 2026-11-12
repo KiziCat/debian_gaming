@@ -5,22 +5,40 @@
 #   sudo build-cachyos-kernel                 build + install
 #   sudo build-cachyos-kernel --no-install    build only (debs land in /var/cache/handheld-kernels)
 #
+# Full log: /var/log/cachyos-kernel-build.log   (on failure the source tree is kept in $WORK for a retry)
+#
 # Environment overrides:
 #   KERNEL_VERSION=7.0.8   PATCH_SERIES=7.0   X86_LEVEL=2|3   JOBS=4   WORK=/var/tmp/cachyos-build
-#   FAST_BUILD=1           drop debug info + BTF (much faster/smaller build, but no sched_ext/scx)
-#   KEEP_WORK=1            keep the source tree afterwards
+#   FAST_BUILD=0           keep debug info + BTF (needed for sched_ext/scx; slower, ~2x disk, more can go wrong)
+#   KEEP_WORK=1            keep the source tree even after a successful build
 set -Eeuo pipefail
 [[ $EUID -eq 0 ]] || exec sudo -E "$0" "$@"
 
 INSTALL=1; [[ ${1:-} == --no-install ]] && INSTALL=0
 WORK=${WORK:-/var/tmp/cachyos-build}
 OUT=/var/cache/handheld-kernels
+LOG=/var/log/cachyos-kernel-build.log
+FAST_BUILD=${FAST_BUILD:-1}
 PATCH_RAW=https://raw.githubusercontent.com/CachyOS/kernel-patches/master
 CONFIG_URL=https://raw.githubusercontent.com/CachyOS/linux-cachyos/master/linux-cachyos/config
 export DEBIAN_FRONTEND=noninteractive
 
-say() { echo -e "\e[32m[cachyos-kernel]\e[0m $*"; }
-die() { echo -e "\e[31m[cachyos-kernel] $*\e[0m" >&2; exit 1; }
+mkdir -p "$(dirname "$LOG")" "$OUT"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== build-cachyos-kernel $(date -Is) ==="
+
+STEP="starting"
+say()  { echo -e "\e[32m[cachyos-kernel]\e[0m $*"; }
+step() { STEP=$1; say "$1"; }
+die()  { echo -e "\e[31m[cachyos-kernel] $*\e[0m" >&2; exit 1; }
+on_error() {
+    local rc=$?
+    echo -e "\n\e[31m[cachyos-kernel] FAILED during: $STEP (exit $rc)\e[0m" >&2
+    echo "---- last 40 lines of the log ----" >&2
+    tail -n 40 "$LOG" >&2 || true
+    echo "---- full log: $LOG   source tree kept in: $WORK ----" >&2
+}
+trap on_error ERR
 
 # ---- micro-architecture level ----------------------------------------------------------
 if [[ -z ${X86_LEVEL:-} ]]; then
@@ -31,57 +49,79 @@ if [[ -z ${X86_LEVEL:-} ]]; then
     done
 fi
 
-# ---- build dependencies ----------------------------------------------------------------
-say "Installing build dependencies..."
-apt-get update -qq
-apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libncurses-dev dwarves cpio kmod rsync \
-    dpkg-dev fakeroot debhelper curl xz-utils zstd git python3 perl patch initramfs-tools linux-base
-
-# ---- pick versions ---------------------------------------------------------------------
-if [[ -z ${KERNEL_VERSION:-} || -z ${PATCH_SERIES:-} ]]; then
-    say "Querying kernel.org and the CachyOS patch repository..."
-    read -r KERNEL_VERSION PATCH_SERIES < <(python3 - <<'PY'
-import json, re, urllib.request
-def get(u):
-    r = urllib.request.Request(u, headers={"User-Agent": "handheld-installer"})
-    return urllib.request.urlopen(r, timeout=30).read()
-key = lambda v: tuple(int(x) for x in v.split("."))
-rel = json.loads(get("https://www.kernel.org/releases.json"))
-stable = [r["version"] for r in rel["releases"] if r["moniker"] in ("stable", "longterm")]
-latest = rel["latest_stable"]["version"]
-dirs = [d["name"] for d in json.loads(get("https://api.github.com/repos/CachyOS/kernel-patches/contents/"))
-        if d["type"] == "dir" and re.fullmatch(r"\d+\.\d+", d["name"])]
-want = ".".join(latest.split(".")[:2])
-series = want if want in dirs else max((d for d in dirs if key(d) <= key(want)), key=key)
-cands = [v for v in stable if ".".join(v.split(".")[:2]) == series]
-print(max(cands, key=key) if cands else series, series)
-PY
-    )
-fi
-[[ -n $KERNEL_VERSION && -n $PATCH_SERIES ]] || die "could not determine kernel/patch version"
-say "Kernel $KERNEL_VERSION  | CachyOS patch series $PATCH_SERIES  | x86-64-v$X86_LEVEL"
-
-# ---- RAM-aware parallelism -------------------------------------------------------------
+# ---- preflight: disk space + RAM ---------------------------------------------------------
+mkdir -p "$(dirname "$WORK")"
+avail_gb=$(df -BG --output=avail "$(dirname "$WORK")" | tail -n1 | tr -dc '0-9')
+need_gb=12; [[ $FAST_BUILD == 1 ]] || need_gb=28
+((avail_gb >= need_gb)) || die "Only ${avail_gb} GB free on $(dirname "$WORK"); need about ${need_gb} GB for the build (FAST_BUILD=$FAST_BUILD)."
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 max_by_mem=$(( mem_kb / 1500000 )); ((max_by_mem < 1)) && max_by_mem=1
 JOBS=${JOBS:-$(( $(nproc) < max_by_mem ? $(nproc) : max_by_mem ))}
 
+# ---- build dependencies ----------------------------------------------------------------
+step "Installing build dependencies"
+apt-get update -qq
+apt-get install -y build-essential bc bison flex libssl-dev libelf-dev libncurses-dev dwarves cpio kmod rsync \
+    dpkg-dev fakeroot debhelper curl xz-utils zstd git python3 perl patch initramfs-tools linux-base lsb-release
+
+# ---- pick versions ---------------------------------------------------------------------
+# Newest kernel.org stable/longterm series for which CachyOS has published BOTH patches.
+# (No GitHub API: it rate-limits anonymous callers, which makes this step fail intermittently.)
+if [[ -z ${KERNEL_VERSION:-} || -z ${PATCH_SERIES:-} ]]; then
+    step "Querying kernel.org and the CachyOS patch repository"
+    picked=$(PATCH_RAW=$PATCH_RAW python3 - <<'PY'
+import json, os, sys, urllib.request, urllib.error
+RAW = os.environ["PATCH_RAW"]
+UA = {"User-Agent": "handheld-installer"}
+def get(u):
+    return urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=30).read()
+def exists(u):
+    try:
+        urllib.request.urlopen(urllib.request.Request(u, method="HEAD", headers=UA), timeout=20)
+        return True
+    except urllib.error.HTTPError:
+        return False
+key = lambda v: tuple(int(x) for x in v.split("."))
+rel = json.loads(get("https://www.kernel.org/releases.json"))
+best = {}
+for r in rel["releases"]:
+    if r["moniker"] in ("stable", "longterm"):
+        s = ".".join(r["version"].split(".")[:2])
+        if s not in best or key(r["version"]) > key(best[s]):
+            best[s] = r["version"]
+for s in sorted(best, key=key, reverse=True):
+    if exists(f"{RAW}/{s}/all/0001-cachyos-base-all.patch") and exists(f"{RAW}/{s}/sched/0001-bore-cachy.patch"):
+        print(best[s], s)
+        sys.exit(0)
+sys.exit("no kernel.org series has a matching CachyOS patch set")
+PY
+    ) || die "could not determine kernel/patch version (network? see log)"
+    read -r KERNEL_VERSION PATCH_SERIES <<<"$picked"
+fi
+[[ -n $KERNEL_VERSION && -n $PATCH_SERIES ]] || die "could not determine kernel/patch version"
+say "Kernel $KERNEL_VERSION | CachyOS patch series $PATCH_SERIES | x86-64-v$X86_LEVEL | $JOBS jobs | FAST_BUILD=$FAST_BUILD"
+
 # ---- fetch -----------------------------------------------------------------------------
-rm -rf "$WORK"; mkdir -p "$WORK" "$OUT"; cd "$WORK"
+step "Downloading kernel source $KERNEL_VERSION"
+rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
 major=${KERNEL_VERSION%%.*}
-say "Downloading kernel source..."
 curl -fL --retry 3 -o linux.tar.xz "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KERNEL_VERSION}.tar.xz"
 tar -xf linux.tar.xz && rm linux.tar.xz
 cd "linux-${KERNEL_VERSION}"
 
-say "Fetching CachyOS patches + config..."
+step "Fetching CachyOS patches + config"
 curl -fL --retry 3 -o ../cachyos-base.patch "$PATCH_RAW/$PATCH_SERIES/all/0001-cachyos-base-all.patch"
 curl -fL --retry 3 -o ../bore.patch         "$PATCH_RAW/$PATCH_SERIES/sched/0001-bore-cachy.patch"
 curl -fL --retry 3 -o .config               "$CONFIG_URL"
-patch -Np1 < ../cachyos-base.patch
-patch -Np1 < ../bore.patch
+
+step "Applying CachyOS patches (base, BORE)"
+for pf in ../cachyos-base.patch ../bore.patch; do
+    patch -Np1 --dry-run < "$pf" >/dev/null || die "$(basename "$pf") does not apply cleanly to Linux $KERNEL_VERSION (patch series $PATCH_SERIES is probably built for a newer point release). Retry in a day or two, or set KERNEL_VERSION=<other 6.x/7.x release>."
+    patch -Np1 < "$pf"
+done
 
 # ---- configure -------------------------------------------------------------------------
+step "Configuring"
 echo "-cachyos" > localversion.20-cachyos
 scripts/config --set-str LOCALVERSION "" -d LOCALVERSION_AUTO
 scripts/config -e CACHY -e SCHED_BORE
@@ -94,21 +134,33 @@ if grep -q 'GENERIC_CPU3' arch/x86/Kconfig.cpu 2>/dev/null; then
 else
     say "WARNING: patchset has no generic-v2/v3 CPU option, building with the config default"
 fi
-if [[ ${FAST_BUILD:-0} == 1 ]]; then
-    scripts/config -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -e DEBUG_INFO_NONE -d DEBUG_INFO_DWARF5 -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT || true
+if [[ $FAST_BUILD == 1 ]]; then
+    # Debug info + BTF is the usual cause of failed or enormous builds (pahole, disk space). Only sched_ext/scx needs it.
+    scripts/config -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES -d DEBUG_INFO_DWARF5 -d DEBUG_INFO_DWARF4 \
+                   -d DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT -d DEBUG_INFO_REDUCED -e DEBUG_INFO_NONE || true
 fi
 make olddefconfig
 rel=$(make -s kernelrelease)
-say "Building $rel with $JOBS jobs (this is the slow part)..."
+[[ -n $rel ]] || die "could not determine the kernel release string"
+say "Kernel release will be: $rel"
 
 # ---- build -----------------------------------------------------------------------------
-make -j"$JOBS" bindeb-pkg KDEB_PKGVERSION="${KERNEL_VERSION}-1" KBUILD_BUILD_USER=handheld KBUILD_BUILD_HOST=debian
+# DPKG_FLAGS=-d: we installed the dependencies ourselves; skip dpkg's strict build-dep check
+# (it chokes on multiarch ':native' dependencies on systems with i386 enabled).
+step "Compiling $rel (this is the slow part)"
+make -j"$JOBS" bindeb-pkg DPKG_FLAGS=-d KDEB_PKGVERSION="${KERNEL_VERSION}-1" KBUILD_BUILD_USER=handheld KBUILD_BUILD_HOST=debian
+
+step "Collecting packages"
 cd "$WORK"
-cp -v linux-image-"${rel}"_*.deb linux-headers-"${rel}"_*.deb "$OUT/"
+shopt -s nullglob
+imgs=(linux-image-"${rel}"_*.deb); hdrs=(linux-headers-"${rel}"_*.deb)
+((${#imgs[@]})) || die "build finished but no linux-image-${rel}_*.deb was produced (ls: $(ls "$WORK" | tr '\n' ' '))"
+cp -v "${imgs[@]}" "${hdrs[@]}" "$OUT/"
 
 if ((INSTALL)); then
-    say "Installing $rel (initramfs + Limine entry are generated by the kernel hooks)..."
-    apt-get install -y "$OUT"/linux-image-"${rel}"_*.deb "$OUT"/linux-headers-"${rel}"_*.deb
+    step "Installing $rel (initramfs + Limine entry are generated by the kernel hooks)"
+    apt-get install -y "${imgs[@]/#/$OUT/}" "${hdrs[@]/#/$OUT/}"
 fi
+trap - ERR
 [[ ${KEEP_WORK:-0} == 1 ]] || rm -rf "$WORK"
 say "Done. Packages are in $OUT"
