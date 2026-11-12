@@ -11,10 +11,11 @@ with a "Steam Big Picture" desktop shortcut, Flatpak with Flathub / Bazaar / Pro
 ## Usage
 
 1. Boot a Debian 13 Live ISO **in UEFI mode**, connect to the network.
-2. ```git clone https://github.com/KiziCat/debian_gaming && cd debian_gaming
-tar -xf debian-handheld-installer.tar.gz && cd debian-handheld-installer
-chmod +x install.sh chroot/*.sh files/*
-sudo ./install.sh
+2. ```sh
+   git clone https://github.com/KiziCat/debian_gaming && cd debian_gaming
+   tar -xf debian-handheld-installer.tar.gz && cd debian-handheld-installer
+   chmod +x install.sh chroot/*.sh files/*
+   sudo ./install.sh
    ```
 3. Answer the prompts: pick the disk by number, hostname, user + password, timezone (type `Warsaw`, `europe/berlin`, `new york`...),
    locale, keyboard, autologin, hhd, XanMod yes/no and branch.
