@@ -4,7 +4,7 @@
 #     git clone <your-repo> && cd debian-handheld-installer && sudo ./install.sh
 #
 # Non-interactive example (VM testing):
-#     DISK=/dev/vda USERNAME=deck USERPASS=deck TARGET_HOSTNAME=handheld ASSUME_YES=1 CACHY_MODE=later ./install.sh
+#     DISK=/dev/vda USERNAME=deck USERPASS=deck TARGET_HOSTNAME=handheld ASSUME_YES=1 INSTALL_XANMOD=yes ./install.sh
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -104,19 +104,18 @@ if [[ -z ${INSTALL_HHD:-} ]]; then
     ask_yn "Install Handheld Daemon (hhd) for controller/TDP/gyro support?" "$d" && INSTALL_HHD=yes || INSTALL_HHD=no
 fi
 
-shopt -s nullglob
-prebuilt=("$SCRIPT_DIR"/prebuilt/linux-image-*cachyos*.deb)
-shopt -u nullglob
-if [[ -z ${CACHY_MODE:-} ]]; then
+if [[ -z ${INSTALL_XANMOD:-} ]]; then
     echo
-    info "CachyOS kernel (BORE scheduler etc.) - Debian has no package, so it is built into .deb files:"
-    echo "   1) build    - compile on this machine during install (30-120+ min, ~20 GB temp space)"
-    echo "   2) prebuilt - use .deb files from ./prebuilt (${#prebuilt[@]} image package(s) found)"
-    echo "   3) later    - skip now; run 'sudo build-cachyos-kernel' after first boot"
-    def=1; ((${#prebuilt[@]})) && def=2
-    case "$(ask "Choice" "$def")" in 1) CACHY_MODE=build ;; 2) CACHY_MODE=prebuilt ;; 3) CACHY_MODE=later ;; *) die "Invalid choice" ;; esac
+    info "Second kernel: XanMod (prebuilt from deb.xanmod.org - tuned for your CPU level, ThinLTO, sched_ext, plus scx_lavd)."
+    ask_yn "Install XanMod next to the Debian LTS kernel?" y && INSTALL_XANMOD=yes || INSTALL_XANMOD=no
 fi
-[[ $CACHY_MODE != prebuilt || ${#prebuilt[@]} -gt 0 ]] || die "CACHY_MODE=prebuilt but no linux-image-*cachyos*.deb in $SCRIPT_DIR/prebuilt"
+if [[ $INSTALL_XANMOD == yes && -z ${XANMOD_BRANCH:-} ]]; then
+    echo "   1) main - latest stable kernel (default)"
+    echo "   2) lts  - long-term support kernel"
+    case "$(ask "Choice" 1)" in 2) XANMOD_BRANCH=lts ;; *) XANMOD_BRANCH=main ;; esac
+fi
+XANMOD_BRANCH=${XANMOD_BRANCH:-main}
+[[ $XANMOD_BRANCH =~ ^(main|lts|edge)$ ]] || die "XANMOD_BRANCH must be main, lts or edge"
 
 echo
 warn "ALL DATA ON $DISK WILL BE ERASED:"
@@ -204,7 +203,7 @@ USER_HASH=$(printf '%s' "$USERPASS" | openssl passwd -6 -stdin)
 umask 077
 {
     for v in SUITE DEBIAN_MIRROR TARGET_HOSTNAME USERNAME USER_HASH TIMEZONE LOCALE KB_LAYOUT AUTOLOGIN INSTALL_HHD \
-             CACHY_MODE ROOT_UUID ESP_UUID HW_CPU_VENDOR HW_X86_LEVEL HW_GPU_AMD HW_GPU_INTEL HW_SYS_VENDOR HW_PRODUCT HW_HANDHELD HW_PKGS; do
+             INSTALL_XANMOD XANMOD_BRANCH ROOT_UUID ESP_UUID HW_CPU_VENDOR HW_X86_LEVEL HW_GPU_AMD HW_GPU_INTEL HW_SYS_VENDOR HW_PRODUCT HW_HANDHELD HW_PKGS; do
         printf '%s=%q\n' "$v" "${!v}"
     done
     printf 'ESP_DISK=%q\nESP_PARTNUM=%q\n' "$DISK" 1

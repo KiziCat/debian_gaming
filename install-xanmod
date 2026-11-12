@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# install-xanmod - add the XanMod apt repository and install a prebuilt, CPU-level-tuned XanMod kernel
+# (LLVM ThinLTO, sched_ext, MGLRU) plus the scx schedulers, then enable scx_lavd for XanMod boots.
+# No compiling involved. Run by the installer; also usable later:  sudo install-xanmod
+#
+# Environment:
+#   XANMOD_BRANCH=main|lts|edge   main = latest stable (default), lts = long-term support, edge = newest mainline
+#   XANMOD_LEVEL=1|2|3|4          x86-64 psABI level; detected from /proc/cpuinfo when unset (v4 needs AVX-512, opt-in only)
+#   XANMOD_SUITE=trixie           Debian codename used for the repository (default: from /etc/os-release)
+set -Eeuo pipefail
+[[ $EUID -eq 0 ]] || exec sudo -E "$0" "$@"
+export DEBIAN_FRONTEND=noninteractive
+
+say()  { echo -e "\e[32m[xanmod]\e[0m $*"; }
+warn() { echo -e "\e[33m[xanmod]\e[0m $*" >&2; }
+die()  { echo -e "\e[31m[xanmod] $*\e[0m" >&2; exit 1; }
+trap 'warn "failed near line $LINENO"' ERR
+
+BRANCH=${XANMOD_BRANCH:-main}
+SUITE=${XANMOD_SUITE:-$(. /etc/os-release && echo "${VERSION_CODENAME:-trixie}")}
+case $BRANCH in
+    main) prefix=linux-xanmod ;;
+    lts)  prefix=linux-xanmod-lts ;;
+    edge) prefix=linux-xanmod-edge ;;
+    *)    die "XANMOD_BRANCH must be main, lts or edge" ;;
+esac
+
+# ---- CPU level --------------------------------------------------------------------------
+LEVEL=${XANMOD_LEVEL:-}
+if [[ -z $LEVEL ]]; then
+    flags=$(grep -m1 '^flags' /proc/cpuinfo)
+    LEVEL=3
+    for f in avx2 bmi1 bmi2 fma movbe f16c abm; do
+        grep -qw "$f" <<<"$flags" || { LEVEL=2; break; }
+    done
+fi
+
+has_candidate() {
+    local c
+    c=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2}')
+    [[ -n $c && $c != "(none)" ]]
+}
+
+# ---- repository (key + source + pinning) ---------------------------------------------------
+say "Adding the XanMod repository for $SUITE..."
+apt-get install -y curl gnupg ca-certificates
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://dl.xanmod.org/archive.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $SUITE main" \
+    > /etc/apt/sources.list.d/xanmod-release.list
+
+# The repository also carries dkms, llvm and NVIDIA packages. Keep it from replacing Debian's versions of those:
+# only the kernel packages and scx are taken from it, everything else stays at Debian's.
+cat > /etc/apt/preferences.d/50-xanmod <<'EOF'
+Package: *
+Pin: origin deb.xanmod.org
+Pin-Priority: 1
+
+Package: linux-xanmod* linux-image-*-xanmod* linux-headers-*-xanmod* scx-scheds
+Pin: origin deb.xanmod.org
+Pin-Priority: 600
+EOF
+apt-get update
+
+# ---- kernel: requested level first, then fall back to lower levels ---------------------------
+pkg=""
+for l in "$LEVEL" 3 2 1; do
+    ((l <= LEVEL)) || continue
+    if has_candidate "$prefix-x64v$l"; then pkg="$prefix-x64v$l"; break; fi
+done
+[[ -n $pkg ]] || die "no $prefix-x64v* package found for $SUITE (branch '$BRANCH'). Try XANMOD_BRANCH=lts."
+say "Installing $pkg (kernel hooks will update initramfs + the Limine menu)..."
+apt-get install -y "$pkg"
+
+# ---- sched_ext userspace schedulers ----------------------------------------------------------
+if apt-get install -y scx-scheds; then
+    if command -v scx_lavd >/dev/null 2>&1; then
+        say "Enabling scx_lavd (only active while a XanMod kernel is running)..."
+        [[ -f /etc/default/scx-lavd ]] || cat > /etc/default/scx-lavd <<'EOF'
+# Extra arguments for scx_lavd (see: scx_lavd --help). Empty = scheduler defaults.
+SCX_ARGS=""
+EOF
+        cat > /etc/systemd/system/scx-lavd.service <<'EOF'
+[Unit]
+Description=sched_ext scheduler: scx_lavd
+Documentation=https://github.com/sched-ext/scx
+# Only on kernels that have sched_ext AND are XanMod (the Debian LTS kernel is left alone).
+ConditionPathExists=/sys/kernel/sched_ext
+ConditionKernelVersion=*xanmod*
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/scx-lavd
+ExecStart=/bin/sh -c 'exec scx_lavd $SCX_ARGS'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload || true
+        systemctl enable scx-lavd.service
+    else
+        warn "scx-scheds installed but scx_lavd binary not found - skipping the service."
+    fi
+else
+    warn "scx-scheds could not be installed - the kernel still works, just without scx_lavd."
+fi
+
+# the Limine hook already ran during the kernel install; refresh once more to be sure
+[[ -x /usr/local/sbin/limine-snapper-sync ]] && /usr/local/sbin/limine-snapper-sync || true
+say "Done. If a scheduler ever misbehaves, 'systemctl disable --now scx-lavd' returns you to the kernel's default scheduler."
